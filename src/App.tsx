@@ -39,174 +39,145 @@ function App() {
     mount.appendChild(renderer.domElement);
 
     /* -------------------------------
-     * Voxel bin -> Instanced cubes
+     * Dynamic LOD Voxel System for Performance
      * ------------------------------- */
-    async function buildVoxelsFromBin(url: string) {
+    
+    // LOD配置
+    const LOD_CONFIG = {
+      maxRenderDistance: 200,    // 最大渲染距离
+      lodDistances: [20, 50, 100, 200], // LOD级别距离
+      lodSampleRates: [1, 4, 16, 64],   // 采样率 (1=全部, 4=每4个取1个)
+      maxInstancesPerFrame: 50000,      // 每帧最大实例数
+      voxelSize: 0.5
+    };
+
+    const allVoxels: Array<{x: number, y: number, z: number}> = [];
+    let currentLODMeshes: InstancedMesh[] = [];
+    const lastCameraPosition = new Vector3();
+    let frameCount = 0;
+
+    async function loadVoxelData(url: string) {
       try {
         const resp = await fetch(url);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const buf = await resp.arrayBuffer();
         const view = new DataView(buf);
-        console.log(buf.byteLength)
-        // 根据新的 Python voxel_dtype 结构计算记录大小
-        // cx(float64=8) + cy(float64=8) + cz(float64=8) + filled(bool=1) + neighbors(6*int32=24) = 49 bytes
+        
         const recordSize = 49;
-
-        // 字段偏移（与新的 Python voxel_dtype 一致）
-        const offCx = 0;         // float64
-        const offCy = 8;         // float64
-        const offCz = 16;        // float64
-        const offFilled = 24;    // bool (1 byte)
-        // neighbors 从偏移 25 开始，包含 6 * int32 = 24 bytes，但此处不使用
-
-        // 首先扫描所有记录以确定网格尺寸
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-        
-        // 修复 count 的计算，确保为整数
         const count = Math.floor(buf.byteLength / recordSize);
-        console.log(buf.byteLength / recordSize)
-        // 添加边界检查，确保偏移量不会超出缓冲区范围
-        for (let i = 0; i < count; i++) {
-          const base = i * recordSize;
-          if (base + recordSize > buf.byteLength) {
-            console.warn(`Skipping record at index ${i} due to out-of-bounds access`);
-            continue;
-          }
-
-          const cx = view.getFloat64(base + offCx, true);
-          const cy = view.getFloat64(base + offCy, true);
-          const cz = view.getFloat64(base + offCz, true);
-
-          minX = Math.min(minX, cx);
-          minY = Math.min(minY, cy);
-          minZ = Math.min(minZ, cz);
-          maxX = Math.max(maxX, cx);
-          maxY = Math.max(maxY, cy);
-          maxZ = Math.max(maxZ, cz);
-        }
-
-        // 确保 voxelSize 在计算网格维度之前定义
-        const voxelSize = 0.5; // 与 Python VOXEL_SIZE 一致
-
-        // 修复网格维度计算，改为直接查找最后一个体素的 xyz
-        const lastBase = (count - 1) * recordSize;
-        const lastCx = view.getFloat64(lastBase + offCx, true);
-        const lastCy = view.getFloat64(lastBase + offCy, true);
-        const lastCz = view.getFloat64(lastBase + offCz, true);
-
-        const nx = Math.round((lastCx - minX) / voxelSize) + 1;
-        const ny = Math.round((lastCy - minY) / voxelSize) + 1;
-        const nz = Math.round((lastCz - minZ) / voxelSize) + 1;
-
-        console.log(`Grid dimensions: ${nx} x ${ny} x ${nz}`);
-        console.log(`Grid bounds: X[${minX},${maxX}] Y[${minY},${maxY}] Z[${minZ},${maxZ}]`);
-
-        // 统计 filled voxel 数量
-        let filledCount = 0;
-        for (let i = 0; i < count; i++) {
-          const base = i * recordSize;
-          const filled = view.getUint8(base + offFilled) !== 0;
-          if (filled) filledCount++;
-        }
         
-        console.log(`Found ${filledCount} filled voxels out of ${count} total voxels`);
+        console.log(`Loading ${count} voxels...`);
         
-        if (filledCount === 0) {
-          console.warn('No filled voxels to render');
-          return;
-        }
-
-        // 创建 InstancedMesh
-        const geometry = new BoxGeometry(voxelSize, voxelSize, voxelSize);
-        const material = new MeshStandardMaterial({ 
-          metalness: 0.05, 
-          roughness: 0.8 
-        });
-        const instanced = new InstancedMesh(geometry, material, filledCount);
-        instanced.castShadow = true;
-        instanced.receiveShadow = true;
-
-        // 创建颜色属性
-        const color = new Color();
-
-        // 填充实例矩阵和颜色
-        const dummy = new Object3D();
-        let instanceIdx = 0;
-
+        // 只存储体素位置，不立即渲染
         for (let i = 0; i < count; i++) {
           const base = i * recordSize;
-          const filled = view.getUint8(base + offFilled) !== 0;
+          if (base + recordSize > buf.byteLength) continue;
+          
+          const filled = view.getUint8(base + 24);
           if (!filled) continue;
-
-          const cx = view.getFloat64(base + offCx, true);
-          const cy = view.getFloat64(base + offCy, true);
-          const cz = view.getFloat64(base + offCz, true);
-
-          // 使用 cx, cy, cz 作为世界坐标
-          dummy.position.set(cx, cy, cz);
-          dummy.rotation.set(0, 0, 0);
-          dummy.scale.set(1, 1, 1);
-          dummy.updateMatrix();
-          instanced.setMatrixAt(instanceIdx, dummy.matrix);
-
-          // 为每个实例生成随机颜色
-          color.setHex(Math.random() * 0xffffff);
-          instanced.setColorAt(instanceIdx, color);
-
-          instanceIdx++;
+          
+          const x = view.getFloat64(base + 0, true);
+          const y = view.getFloat64(base + 8, true);
+          const z = view.getFloat64(base + 16, true);
+          
+          allVoxels.push({x, y, z});
         }
-
-        instanced.instanceMatrix.needsUpdate = true;
-        instanced.instanceColor!.needsUpdate = true;
-        scene.add(instanced);
-
-        console.log(`Successfully rendered ${instanceIdx} voxel instances`);
+        
+        console.log(`Loaded ${allVoxels.length} filled voxels`);
+        
+        // 初始渲染
+        updateLODRendering();
         
       } catch (err) {
-        console.error('Failed to build voxels from bin:', err);
+        console.error('Failed to load voxel data:', err);
       }
+    }
+
+    function updateLODRendering() {
+      const camPos = camera.position;
+      
+      // 清理旧的mesh
+      currentLODMeshes.forEach(mesh => {
+        scene.remove(mesh);
+        mesh.dispose();
+      });
+      currentLODMeshes = [];
+
+      const geometry = new BoxGeometry(LOD_CONFIG.voxelSize, LOD_CONFIG.voxelSize, LOD_CONFIG.voxelSize);
+      const material = new MeshStandardMaterial({ 
+        metalness: 0.05, 
+        roughness: 0.8 
+      });
+
+      // 按LOD级别分组
+      const lodGroups: Array<{x: number, y: number, z: number}[]> = [[], [], [], []];
+      let totalProcessed = 0;
+
+      for (const voxel of allVoxels) {
+        const dist = camPos.distanceTo(new Vector3(voxel.x, voxel.y, voxel.z));
+        
+        if (dist > LOD_CONFIG.maxRenderDistance) continue;
+        
+        // 确定LOD级别
+        let lodLevel = 0;
+        for (let i = 0; i < LOD_CONFIG.lodDistances.length; i++) {
+          if (dist < LOD_CONFIG.lodDistances[i]) {
+            lodLevel = i;
+            break;
+          }
+        }
+        
+        // 采样控制
+        const sampleRate = LOD_CONFIG.lodSampleRates[lodLevel];
+        if (totalProcessed % sampleRate !== 0) {
+          totalProcessed++;
+          continue;
+        }
+        
+        lodGroups[lodLevel].push(voxel);
+        totalProcessed++;
+        
+        // 限制总实例数
+        const currentTotal = lodGroups.reduce((sum, group) => sum + group.length, 0);
+        if (currentTotal >= LOD_CONFIG.maxInstancesPerFrame) break;
+      }
+
+      // 为每个LOD级别创建InstancedMesh
+      lodGroups.forEach((group, lodLevel) => {
+        if (group.length === 0) return;
+        
+        const instanced = new InstancedMesh(geometry, material, group.length);
+        const dummy = new Object3D();
+        const color = new Color();
+        
+        // 根据LOD级别设置不同颜色
+        const lodColors = [0xffffff, 0xcccccc, 0x999999, 0x666666];
+        
+        group.forEach((voxel, index) => {
+          dummy.position.set(voxel.x, voxel.y, voxel.z);
+          dummy.updateMatrix();
+          instanced.setMatrixAt(index, dummy.matrix);
+          
+          color.setHex(lodColors[lodLevel]);
+          instanced.setColorAt(index, color);
+        });
+        
+        instanced.instanceMatrix.needsUpdate = true;
+        instanced.instanceColor!.needsUpdate = true;
+        
+        scene.add(instanced);
+        currentLODMeshes.push(instanced);
+      });
+
+      const totalRendered = lodGroups.reduce((sum, group) => sum + group.length, 0);
+      const lodInfo = lodGroups.map((group, i) => `LOD${i}: ${group.length}`).join(', ');
+      console.log(`LOD Update: Rendered ${totalRendered}/${allVoxels.length} voxels (${lodInfo})`);
     }
 
 
 
-    // NOTE: ensure the bin is placed at `voxel-app/public/voxels.bin` so it is served at `/voxels.bin`.
-    buildVoxelsFromBin('/voxel(1).bin');
-
-    /* -------------------------------
-     * (FBX loading is intentionally commented out)
-     * ------------------------------- */
-    // const fbxLoader = new FBXLoader();
-    // fbxLoader.load(
-    //   "/地铁站max/地铁站max/XuZhouDTZ.fbx",
-    //   (fbx) => {
-    //     fbx.scale.set(0.1, 0.1, 0.1);
-
-    //     fbx.traverse((child) => {
-    //       if ((child as Mesh).isMesh) {
-    //         child.castShadow = true;
-    //         child.receiveShadow = true;
-    //         (child as Mesh).material = new MeshStandardMaterial({
-    //           color: 0xdddddd,
-    //           metalness: 0.1,
-    //           roughness: 0.6,
-    //         });
-    //       }
-    //     });
-
-    //     fbx.position.set(0, 0, 0);
-    //     scene.add(fbx);
-
-    //     console.log("FBX loaded:", fbx);
-    //   },
-    //   (xhr) => {
-    //     console.log(`FBX loading: ${(xhr.loaded / xhr.total) * 100}%`);
-    //   },
-    //   (err) => {
-    //     console.error("FBX load error:", err);
-    //   }
-    // );
-
+    // 加载体素数据
+    loadVoxelData('/voxel(3).bin');
     /* -------------------------------
      * Add Lighting
      * ------------------------------- */
@@ -235,13 +206,23 @@ function App() {
       setupCameraControls(camera, mount);
 
     /* -------------------------------
-     * Animation Loop
+     * Animation Loop with LOD Updates
      * ------------------------------- */
     async function initAndAnimate() {
       await renderer.init();
 
       function animate() {
         processKeyboardMovement();
+        
+        // 每30帧或相机移动超过阈值时更新LOD
+        frameCount++;
+        const cameraMoved = lastCameraPosition.distanceTo(camera.position) > 5;
+        
+        if (frameCount % 30 === 0 || cameraMoved) {
+          updateLODRendering();
+          lastCameraPosition.copy(camera.position);
+        }
+        
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
       }
@@ -333,20 +314,24 @@ function App() {
       forward.y = 0;
       forward.normalize();
 
-      if (keysPressed["w"]) camera.position.addScaledVector(up, moveSpeed);
-      if (keysPressed["s"]) camera.position.addScaledVector(up, -moveSpeed);
-
       const right = new Vector3();
       right.crossVectors(forward, new Vector3(0, 1, 0)).normalize();
 
-      if (keysPressed["a"]) camera.position.addScaledVector(right, -moveSpeed);
-      if (keysPressed["d"]) camera.position.addScaledVector(right, moveSpeed);
+      // 上下平移
+      if (keysPressed["w"]) camera.position.addScaledVector(up, moveSpeed);
+      if (keysPressed["s"]) camera.position.addScaledVector(up, -moveSpeed);
 
-      // New arrow key functionality
-      if (keysPressed["arrowup"]) camera.translateZ(-moveSpeed); // Move forward
-      if (keysPressed["arrowdown"]) camera.translateZ(moveSpeed); // Move backward
-      if (keysPressed["arrowleft"]) yaw += moveSpeed / 5; // Turn left
-      if (keysPressed["arrowright"]) yaw -= moveSpeed / 5; // Turn right
+      // 左右旋转摄像头
+      if (keysPressed["a"]) yaw += moveSpeed / 5;
+      if (keysPressed["d"]) yaw -= moveSpeed / 5;
+
+      // 左右平移
+      if (keysPressed["arrowleft"]) camera.position.addScaledVector(right, -moveSpeed);
+      if (keysPressed["arrowright"]) camera.position.addScaledVector(right, moveSpeed);
+
+      // 前后移动
+      if (keysPressed["arrowup"]) camera.translateZ(-moveSpeed);
+      if (keysPressed["arrowdown"]) camera.translateZ(moveSpeed);
 
       camera.rotation.y = yaw;
     }
