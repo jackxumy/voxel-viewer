@@ -66,6 +66,7 @@ const CONFIG = {
 function App() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [debugInfo, setDebugInfo] = useState("Initializing...");
+  const [fps, setFps] = useState<number>(0);
   
   // 状态引用
   const manifestRef = useRef<GlobalManifest | null>(null);
@@ -264,11 +265,26 @@ function App() {
     const { processInput, cleanup: cleanupControls } = setupControls(camera, mount);
 
     let frameId: number;
+    // FPS tracking
+    let frameCount = 0;
+    let lastFpsCalc = performance.now();
     async function animate() {
       await renderer.init();
       function loop() {
         processInput();
         renderer.render(scene, camera);
+
+        // FPS calculation (updates every 500ms)
+        frameCount++;
+        const now = performance.now();
+        const delta = now - lastFpsCalc;
+        if (delta >= 500) {
+          const currentFps = (frameCount / delta) * 1000;
+          setFps(Math.round(currentFps));
+          frameCount = 0;
+          lastFpsCalc = now;
+        }
+
         frameId = requestAnimationFrame(loop);
       }
       loop();
@@ -296,6 +312,9 @@ function App() {
         <div>System: {debugInfo}</div>
         <div style={{marginTop: 5, color: '#aaa', fontSize: '0.9em'}}>
           WASD to Move | Arrows to Look | Shift to Boost
+        </div>
+        <div style={{marginTop: 5, color: '#aaa', fontSize: '0.9em'}}>
+          FPS: {fps}
         </div>
       </div>
       <div ref={mountRef} style={{ width: "100vw", height: "100vh" }} />
@@ -329,7 +348,7 @@ function setupControls(camera: PerspectiveCamera, mount: HTMLElement) {
 
   return {
     processInput: () => {
-      const speed = keys['shift'] ? 2.0 : 0.5;
+      const speed = keys['shift'] ? 2.0 : 0.2;
       const rotSpeed = 0.03;
 
       // 旋转控制 (方向键)
