@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Scene,
   PerspectiveCamera,
@@ -11,355 +11,357 @@ import {
   PCFSoftShadowMap,
   InstancedMesh,
   Object3D,
-  Color,
+  Group,
+  Color
 } from "three";
-import { WebGPURenderer } from "three/webgpu";
+// 如果环境不支持 WebGPU，请改为 import { WebGLRenderer } from "three";
+import { WebGPURenderer } from "three/webgpu"; 
+
+/* -------------------------------
+ * 1. 类型定义 (严格匹配你的 JSON)
+ * ------------------------------- */
+type ChunkMeta = {
+  file: string;
+  x: number;
+  y: number;
+  z: number;
+  count: number;
+};
+
+type LevelManifest = {
+  voxel_size: number;
+  chunk_physical_size: number;
+  chunks: { [key: string]: ChunkMeta };
+};
+
+type GlobalManifest = {
+  base_voxel_size: number;
+  chunk_dimension: number;
+  levels: { [key: string]: LevelManifest };
+};
+
+/* -------------------------------
+ * 2. 配置项
+ * ------------------------------- */
+const CONFIG = {
+  // 定义可见距离 [min, max]
+  // Level 0: 0m ~ 60m
+  // Level 1: 60m ~ 150m (如果你的JSON里有 "1" 层级)
+  // Level 2: 150m ~ 2000m (如果你的JSON里有 "2" 层级)
+  visibilityRanges: {
+    0: [0, 60],
+    1: [60, 150],
+    2: [150, 600],
+    3: [600, 2000] // 新增 LOD4 (level 3)
+  },
+  colors: {
+    0: 0xffffff, // Level 0 颜色 (白色)
+    1: 0xcccccc, // Level 1 颜色 (浅灰)
+    2: 0x999999, // Level 2 颜色 (深灰)
+    3: 0x666666  // Level 3 颜色 (更深的灰)
+  },
+  checkInterval: 200, // LOD 检测频率 (ms)
+};
 
 function App() {
   const mountRef = useRef<HTMLDivElement>(null);
+  const [debugInfo, setDebugInfo] = useState("Initializing...");
+  
+  // 状态引用
+  const manifestRef = useRef<GlobalManifest | null>(null);
+  const loadedChunksRef = useRef<Map<string, InstancedMesh>>(new Map());
+  const loadingQueueRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
 
-    /* -------------------------------
-     * Scene / Camera / Renderer
-     * ------------------------------- */
+    // --- Scene Setup ---
     const scene = new Scene();
-    const camera = new PerspectiveCamera(
-      75,
-      mount.clientWidth / mount.clientHeight,
-      0.1,
-      1000
-    );
-    camera.position.set(0, 1, 5);
+    scene.background = new Color(0x202020);
+    
+    const camera = new PerspectiveCamera(75, mount.clientWidth / mount.clientHeight, 0.1, 3000);
+    camera.position.set(50, 50, 50); // 初始位置
 
-    const renderer = new WebGPURenderer();
+    const renderer = new WebGPURenderer({ antialias: true });
     renderer.setSize(mount.clientWidth, mount.clientHeight);
+    // disable shadows for now to simplify rendering and improve performance
+    renderer.shadowMap.enabled = false;
     mount.appendChild(renderer.domElement);
 
-    /* -------------------------------
-     * Dynamic LOD Voxel System for Performance
-     * ------------------------------- */
-    
-    // LOD配置
-    const LOD_CONFIG = {
-      maxRenderDistance: 200,    // 最大渲染距离
-      lodDistances: [20, 50, 100, 200], // LOD级别距离
-      lodSampleRates: [1, 4, 16, 64],   // 采样率 (1=全部, 4=每4个取1个)
-      maxInstancesPerFrame: 50000,      // 每帧最大实例数
-      voxelSize: 0.5
+    const worldGroup = new Group();
+    scene.add(worldGroup);
+
+    // --- Shared Geometry & Materials ---
+    const geometry = new BoxGeometry(1, 1, 1);
+    const materials: { [key: number]: MeshStandardMaterial } = {
+      0: new MeshStandardMaterial({ color: CONFIG.colors[0], roughness: 0.8 }),
+      1: new MeshStandardMaterial({ color: CONFIG.colors[1], roughness: 0.9 }),
+      2: new MeshStandardMaterial({ color: CONFIG.colors[2], roughness: 1.0 }),
+      3: new MeshStandardMaterial({ color: CONFIG.colors[3], roughness: 1.0 }), // LOD4 material
     };
 
-    const allVoxels: Array<{x: number, y: number, z: number}> = [];
-    let currentLODMeshes: InstancedMesh[] = [];
-    const lastCameraPosition = new Vector3();
-    let frameCount = 0;
-
-    async function loadVoxelData(url: string) {
-      try {
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const buf = await resp.arrayBuffer();
-        const view = new DataView(buf);
-        
-        const recordSize = 49;
-        const count = Math.floor(buf.byteLength / recordSize);
-        
-        console.log(`Loading ${count} voxels...`);
-        
-        // 只存储体素位置，不立即渲染
-        for (let i = 0; i < count; i++) {
-          const base = i * recordSize;
-          if (base + recordSize > buf.byteLength) continue;
-          
-          const filled = view.getUint8(base + 24);
-          if (!filled) continue;
-          
-          const x = view.getFloat64(base + 0, true);
-          const y = view.getFloat64(base + 8, true);
-          const z = view.getFloat64(base + 16, true);
-          
-          allVoxels.push({x, y, z});
-        }
-        
-        console.log(`Loaded ${allVoxels.length} filled voxels`);
-        
-        // 初始渲染
-        updateLODRendering();
-        
-      } catch (err) {
-        console.error('Failed to load voxel data:', err);
-      }
-    }
-
-    function updateLODRendering() {
-      const camPos = camera.position;
+    /* -----------------------------------------------------------
+     * 核心逻辑: 加载单个区块
+     * ----------------------------------------------------------- */
+    async function loadChunkMesh(level: string, chunkId: string, meta: ChunkMeta, voxelSize: number) {
+      const uniqueKey = `${level}_${chunkId}`;
       
-      // 清理旧的mesh
-      currentLODMeshes.forEach(mesh => {
-        scene.remove(mesh);
-        mesh.dispose();
-      });
-      currentLODMeshes = [];
+      // 防止重复加载
+      if (loadingQueueRef.current.has(uniqueKey)) return;
+      loadingQueueRef.current.add(uniqueKey);
 
-      const geometry = new BoxGeometry(LOD_CONFIG.voxelSize, LOD_CONFIG.voxelSize, LOD_CONFIG.voxelSize);
-      const material = new MeshStandardMaterial({ 
-        metalness: 0.05, 
-        roughness: 0.8 
-      });
+      try {
+        const url = `/chunks/${level}/${meta.file}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        
+        const buffer = await res.arrayBuffer();
+        const positions = new Float32Array(buffer);
+        const count = positions.length / 3;
 
-      // 按LOD级别分组
-      const lodGroups: Array<{x: number, y: number, z: number}[]> = [[], [], [], []];
-      let totalProcessed = 0;
+        // 创建 InstancedMesh
+        const mat = materials[level as unknown as keyof typeof materials] || materials[0];
+        const mesh = new InstancedMesh(geometry, mat, count);
+        
+        // shadows disabled by global setting
 
-      for (const voxel of allVoxels) {
-        const dist = camPos.distanceTo(new Vector3(voxel.x, voxel.y, voxel.z));
-        
-        if (dist > LOD_CONFIG.maxRenderDistance) continue;
-        
-        // 确定LOD级别
-        let lodLevel = 0;
-        for (let i = 0; i < LOD_CONFIG.lodDistances.length; i++) {
-          if (dist < LOD_CONFIG.lodDistances[i]) {
-            lodLevel = i;
-            break;
-          }
-        }
-        
-        // 采样控制
-        const sampleRate = LOD_CONFIG.lodSampleRates[lodLevel];
-        if (totalProcessed % sampleRate !== 0) {
-          totalProcessed++;
-          continue;
-        }
-        
-        lodGroups[lodLevel].push(voxel);
-        totalProcessed++;
-        
-        // 限制总实例数
-        const currentTotal = lodGroups.reduce((sum, group) => sum + group.length, 0);
-        if (currentTotal >= LOD_CONFIG.maxInstancesPerFrame) break;
-      }
-
-      // 为每个LOD级别创建InstancedMesh
-      lodGroups.forEach((group, lodLevel) => {
-        if (group.length === 0) return;
-        
-        const instanced = new InstancedMesh(geometry, material, group.length);
         const dummy = new Object3D();
-        const color = new Color();
-        
-        // 根据LOD级别设置不同颜色
-        const lodColors = [0xffffff, 0xcccccc, 0x999999, 0x666666];
-        
-        group.forEach((voxel, index) => {
-          dummy.position.set(voxel.x, voxel.y, voxel.z);
-          dummy.updateMatrix();
-          instanced.setMatrixAt(index, dummy.matrix);
-          
-          color.setHex(lodColors[lodLevel]);
-          instanced.setColorAt(index, color);
-        });
-        
-        instanced.instanceMatrix.needsUpdate = true;
-        instanced.instanceColor!.needsUpdate = true;
-        
-        scene.add(instanced);
-        currentLODMeshes.push(instanced);
-      });
+        const scale = voxelSize; 
 
-      const totalRendered = lodGroups.reduce((sum, group) => sum + group.length, 0);
-      const lodInfo = lodGroups.map((group, i) => `LOD${i}: ${group.length}`).join(', ');
-      console.log(`LOD Update: Rendered ${totalRendered}/${allVoxels.length} voxels (${lodInfo})`);
+        // 填充矩阵
+        for (let i = 0; i < count; i++) {
+          const x = positions[i * 3 + 0];
+          const y = positions[i * 3 + 1];
+          const z = positions[i * 3 + 2];
+          
+          dummy.position.set(x, y, z);
+          dummy.scale.set(scale, scale, scale);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+        }
+        
+        mesh.instanceMatrix.needsUpdate = true;
+        
+        // 关键：禁止视锥体剔除，因为 InstancedMesh 默认包围盒计算可能不准，
+        // 或者手动计算 mesh.geometry.boundingSphere。为简单起见先设为 false。
+        mesh.frustumCulled = false;
+        
+        mesh.visible = true; // 加载完成后默认显示
+
+        worldGroup.add(mesh);
+        loadedChunksRef.current.set(uniqueKey, mesh);
+
+      } catch (err) {
+        console.warn(`Failed to load ${uniqueKey}:`, err);
+      } finally {
+        loadingQueueRef.current.delete(uniqueKey);
+      }
     }
 
+    /* -----------------------------------------------------------
+     * 核心逻辑: LOD 循环检测
+     * ----------------------------------------------------------- */
+    function updateLOD() {
+      if (!manifestRef.current) return;
+      
+      const levels = manifestRef.current.levels;
+      const cameraPos = camera.position;
 
+      // 统计数据用于 Debug
+      let visibleChunks = 0;
+      let loadedCount = loadedChunksRef.current.size;
 
-    // 加载体素数据
-    loadVoxelData('/voxel(3).bin');
-    /* -------------------------------
-     * Add Lighting
-     * ------------------------------- */
+      // 遍历 manifest 中的每一层 (0, 1, 2...)
+      Object.keys(levels).forEach((levelKey) => {
+        const levelData = levels[levelKey];
+        if (!levelData || !levelData.chunks) return;
+
+        const levelNum = parseInt(levelKey);
+        // 获取该层级的可视范围，如果没有定义则默认不显示
+        const range = CONFIG.visibilityRanges[levelNum as keyof typeof CONFIG.visibilityRanges];
+        if (!range) return;
+        const [minDist, maxDist] = range;
+
+        const halfSize = levelData.chunk_physical_size / 2;
+
+        // 遍历该层级下的所有区块
+        Object.entries(levelData.chunks).forEach(([chunkId, meta]) => {
+          const uniqueKey = `${levelKey}_${chunkId}`;
+          
+          // 计算距离：相机 <-> 区块中心
+          const dist = Math.sqrt(
+            (cameraPos.x - (meta.x + halfSize)) ** 2 + 
+            (cameraPos.y - (meta.y + halfSize)) ** 2 + 
+            (cameraPos.z - (meta.z + halfSize)) ** 2
+          );
+
+          // 判断是否在范围内
+          const shouldBeVisible = dist >= minDist && dist < maxDist;
+          const mesh = loadedChunksRef.current.get(uniqueKey);
+
+          if (shouldBeVisible) {
+            visibleChunks++;
+            if (mesh) {
+              mesh.visible = true;
+            } else {
+              // 还没加载，现在去加载
+              loadChunkMesh(levelKey, chunkId, meta, levelData.voxel_size);
+            }
+          } else {
+            // 超出范围，隐藏
+            if (mesh) {
+              mesh.visible = false;
+            }
+          }
+        });
+      });
+
+      setDebugInfo(`Chunks: ${loadedCount} loaded / ${visibleChunks} visible`);
+    }
+
+    /* -----------------------------------------------------------
+     * 初始化
+     * ----------------------------------------------------------- */
+    async function init() {
+      try {
+        setDebugInfo("Fetching manifest...");
+        const res = await fetch('/chunks/manifest.json');
+        if (!res.ok) throw new Error("Manifest not found");
+        
+        const manifest: GlobalManifest = await res.json();
+        
+        // 简单校验
+        if (!manifest.levels || !manifest.levels["0"]) {
+          throw new Error("Manifest is valid but contains no levels.");
+        }
+
+        manifestRef.current = manifest;
+        setDebugInfo("Manifest loaded. Starting engine...");
+
+        // 启动 LOD 检测循环
+        const interval = setInterval(updateLOD, CONFIG.checkInterval);
+        return interval;
+
+      } catch (e: any) {
+        setDebugInfo(`Error: ${e.message}`);
+        console.error(e);
+      }
+    }
+
+    const intervalPromise = init();
+
+    // --- Lights ---
     const ambient = new AmbientLight(0xffffff, 0.6);
     scene.add(ambient);
-    /* 半球光，上方偏蓝，下方偏暖 */
-    const hemiLight = new HemisphereLight(0xffffff, 0x444444, 0.8);
-    hemiLight.position.set(0, 20, 0);
-    scene.add(hemiLight);
-
-    const dirLight = new DirectionalLight(0xffffff, 1.0);
-    dirLight.position.set(5, 10, 5);
-    dirLight.castShadow = true;
+    const dirLight = new DirectionalLight(0xffffff, 1.5);
+    dirLight.position.set(100, 200, 100);
+    // disable shadows on the directional light for now
+    dirLight.castShadow = false;
     scene.add(dirLight);
 
-    /* -------------------------------
-     * Enable Shadows in WebGPURenderer
-     * ------------------------------- */
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = PCFSoftShadowMap;
+    // --- Controls & Loop ---
+    const { processInput, cleanup: cleanupControls } = setupControls(camera, mount);
 
-    /* -------------------------------
-     * Camera Controls
-     * ------------------------------- */
-    const { processKeyboardMovement, cleanup: cleanupCameraControls } =
-      setupCameraControls(camera, mount);
-
-    /* -------------------------------
-     * Animation Loop with LOD Updates
-     * ------------------------------- */
-    async function initAndAnimate() {
+    let frameId: number;
+    async function animate() {
       await renderer.init();
-
-      function animate() {
-        processKeyboardMovement();
-        
-        // 每30帧或相机移动超过阈值时更新LOD
-        frameCount++;
-        const cameraMoved = lastCameraPosition.distanceTo(camera.position) > 5;
-        
-        if (frameCount % 30 === 0 || cameraMoved) {
-          updateLODRendering();
-          lastCameraPosition.copy(camera.position);
-        }
-        
+      function loop() {
+        processInput();
         renderer.render(scene, camera);
-        requestAnimationFrame(animate);
+        frameId = requestAnimationFrame(loop);
       }
-
-      animate();
+      loop();
     }
+    animate();
 
-    initAndAnimate();
-
-    /* -------------------------------
-     * Cleanup
-     * ------------------------------- */
     return () => {
-      cleanupCameraControls();
+      cancelAnimationFrame(frameId);
+      intervalPromise.then(id => id && clearInterval(id));
+      cleanupControls();
       mount.removeChild(renderer.domElement);
+      // cleanup resources
+      geometry.dispose();
+      Object.values(materials).forEach(m => m.dispose());
     };
   }, []);
 
-  /* -------------------------------
-   * Camera Control Logic
-   * ------------------------------- */
-  function setupCameraControls(camera: PerspectiveCamera, mount: HTMLDivElement) {
-    let isMouseDown = false;
-    let lastMouseX = 0;
-    let lastMouseY = 0;
+  return (
+    <>
+      <div style={{
+        position: 'absolute', top: 10, left: 10, padding: 12,
+        background: 'rgba(0,0,0,0.8)', color: '#0f0', 
+        fontFamily: 'monospace', pointerEvents: 'none', borderRadius: 4
+      }}>
+        <div>System: {debugInfo}</div>
+        <div style={{marginTop: 5, color: '#aaa', fontSize: '0.9em'}}>
+          WASD to Move | Arrows to Look | Shift to Boost
+        </div>
+      </div>
+      <div ref={mountRef} style={{ width: "100vw", height: "100vh" }} />
+    </>
+  );
+}
 
-    let yaw = 0;
-    let pitch = 0;
+/* -----------------------------------------------------------
+ * 辅助: 相机控制器
+ * ----------------------------------------------------------- */
+function setupControls(camera: PerspectiveCamera, mount: HTMLElement) {
+  const keys: Record<string, boolean> = {};
+  let yaw = 0;   // 左右旋转
+  let pitch = 0; // 上下旋转
 
-    const moveSpeed = 0.5;
-    const keysPressed: Record<string, boolean> = {};
+  const onKeyDown = (e: KeyboardEvent) => keys[e.key.toLowerCase()] = true;
+  const onKeyUp = (e: KeyboardEvent) => keys[e.key.toLowerCase()] = false;
 
-    /* --- Mouse drag to look --- */
-    function onMouseDown(e: MouseEvent) {
-      isMouseDown = true;
-      lastMouseX = e.clientX;
-      lastMouseY = e.clientY;
+  const onMouseMove = (e: MouseEvent) => {
+    if (e.buttons === 1) {
+      yaw -= e.movementX * 0.005;
+      pitch -= e.movementY * 0.005;
+      pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, pitch));
+      camera.rotation.set(pitch, yaw, 0, 'YXZ');
     }
+  };
 
-    function onMouseUp() {
-      isMouseDown = false;
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  mount.addEventListener('mousemove', onMouseMove);
+
+  return {
+    processInput: () => {
+      const speed = keys['shift'] ? 2.0 : 0.5;
+      const rotSpeed = 0.03;
+
+      // 旋转控制 (方向键)
+      if (keys['arrowleft']) yaw += rotSpeed;
+      if (keys['arrowright']) yaw -= rotSpeed;
+      if (keys['arrowup']) pitch += rotSpeed;
+      if (keys['arrowdown']) pitch -= rotSpeed;
+      
+      // 限制上下视角
+      pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, pitch));
+
+      camera.rotation.set(pitch, yaw, 0, 'YXZ');
+
+      // 移动控制 (WASD)
+      const dir = new Vector3();
+      camera.getWorldDirection(dir);
+      const forward = dir.clone();
+      const right = new Vector3().crossVectors(dir, new Vector3(0, 1, 0)).normalize();
+
+      if (keys['w']) camera.position.addScaledVector(forward, speed);
+      if (keys['s']) camera.position.addScaledVector(forward, -speed);
+      if (keys['a']) camera.position.addScaledVector(right, -speed);
+      if (keys['d']) camera.position.addScaledVector(right, speed);
+      if (keys['q']) camera.position.y -= speed;
+      if (keys['e']) camera.position.y += speed;
+    },
+    cleanup: () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      mount.removeEventListener('mousemove', onMouseMove);
     }
-
-    function onMouseMove(e: MouseEvent) {
-      if (!isMouseDown) return;
-
-      const dx = e.clientX - lastMouseX;
-      const dy = e.clientY - lastMouseY;
-
-      lastMouseX = e.clientX;
-      lastMouseY = e.clientY;
-
-      const sensitivity = 0.002;
-
-      yaw -= dx * sensitivity;
-      pitch -= dy * sensitivity;
-
-      const maxPitch = Math.PI / 2 - 0.1;
-      pitch = Math.max(-maxPitch, Math.min(maxPitch, pitch));
-
-      camera.rotation.order = "YXZ";
-      camera.rotation.y = yaw;
-      camera.rotation.x = pitch;
-    }
-
-    /* --- Scroll forward/backward --- */
-    function onWheel(e: WheelEvent) {
-      const delta = -e.deltaY * 0.02;
-
-      const forward = new Vector3();
-      camera.getWorldDirection(forward);
-      camera.position.addScaledVector(forward, delta);
-    }
-
-    /* --- Keyboard --- */
-    function onKeyDown(e: KeyboardEvent) {
-      keysPressed[e.key.toLowerCase()] = true;
-    }
-
-    function onKeyUp(e: KeyboardEvent) {
-      keysPressed[e.key.toLowerCase()] = false;
-    }
-
-    function processKeyboardMovement() {
-      const forward = new Vector3();
-      const up = new Vector3(0, 1, 0);
-
-      camera.getWorldDirection(forward);
-      forward.y = 0;
-      forward.normalize();
-
-      const right = new Vector3();
-      right.crossVectors(forward, new Vector3(0, 1, 0)).normalize();
-
-      // 上下平移
-      if (keysPressed["w"]) camera.position.addScaledVector(up, moveSpeed);
-      if (keysPressed["s"]) camera.position.addScaledVector(up, -moveSpeed);
-
-      // 左右旋转摄像头
-      if (keysPressed["a"]) yaw += moveSpeed / 5;
-      if (keysPressed["d"]) yaw -= moveSpeed / 5;
-
-      // 左右平移
-      if (keysPressed["arrowleft"]) camera.position.addScaledVector(right, -moveSpeed);
-      if (keysPressed["arrowright"]) camera.position.addScaledVector(right, moveSpeed);
-
-      // 前后移动
-      if (keysPressed["arrowup"]) camera.translateZ(-moveSpeed);
-      if (keysPressed["arrowdown"]) camera.translateZ(moveSpeed);
-
-      camera.rotation.y = yaw;
-    }
-
-    /* --- Register events --- */
-    mount.addEventListener("mousedown", onMouseDown);
-    mount.addEventListener("mouseup", onMouseUp);
-    mount.addEventListener("mousemove", onMouseMove);
-    mount.addEventListener("wheel", onWheel);
-
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-
-    return {
-      processKeyboardMovement,
-      cleanup: () => {
-        mount.removeEventListener("mousedown", onMouseDown);
-        mount.removeEventListener("mouseup", onMouseUp);
-        mount.removeEventListener("mousemove", onMouseMove);
-        mount.removeEventListener("wheel", onWheel);
-
-        window.removeEventListener("keydown", onKeyDown);
-        window.removeEventListener("keyup", onKeyUp);
-      },
-    };
-  }
-
-  return <div ref={mountRef} style={{ width: "100vw", height: "100vh" }} />;
+  };
 }
 
 export default App;
