@@ -5,8 +5,10 @@ import {
   BoxGeometry,
   MeshStandardMaterial,
   Vector3,
+  HemisphereLight,
   AmbientLight,
   DirectionalLight,
+  PCFSoftShadowMap,
   InstancedMesh,
   Object3D,
   Group,
@@ -259,115 +261,8 @@ function App() {
     dirLight.castShadow = false;
     scene.add(dirLight);
 
-    // --- Collision Detection ---
-  function checkCollision(newPosition: Vector3, radius: number = 0.25): boolean {
-      // Quick distance check - only test nearby meshes
-      const maxCheckDistance = 10; // Only check collisions within 10 units
-      
-      for (const [key, mesh] of loadedChunksRef.current.entries()) {
-        if (!mesh.visible) continue;
-        
-        // Get mesh level to determine voxel size
-        const level = parseInt(key.split('_')[0]);
-        const levelData = manifestRef.current?.levels[level];
-        if (!levelData) continue;
-        
-        const voxelSize = levelData.voxel_size;
-        const halfVoxel = voxelSize / 2;
-        
-        // Quick distance check to mesh center
-        const chunkKey = key.split('_').slice(1).join('_');
-        const chunkMeta = levelData.chunks[chunkKey];
-        if (!chunkMeta) continue;
-        
-        const chunkCenter = new Vector3(
-          chunkMeta.x + levelData.chunk_physical_size / 2,
-          chunkMeta.y + levelData.chunk_physical_size / 2,
-          chunkMeta.z + levelData.chunk_physical_size / 2
-        );
-        
-        const distanceToChunk = newPosition.distanceTo(chunkCenter);
-        if (distanceToChunk > maxCheckDistance + levelData.chunk_physical_size) continue;
-        
-        // Only check a subset of instances for performance (every 4th instance for higher LODs)
-        const step = level > 0 ? 4 : 1;
-        const tempMatrix = new Object3D();
-        
-        for (let i = 0; i < mesh.count; i += step) {
-          mesh.getMatrixAt(i, tempMatrix.matrix);
-          tempMatrix.matrix.decompose(tempMatrix.position, tempMatrix.quaternion, tempMatrix.scale);
-          
-          // Quick distance check
-          if (newPosition.distanceTo(tempMatrix.position) > radius + halfVoxel + 1) continue;
-          
-          // AABB collision check
-          const voxelMin = tempMatrix.position.clone().subScalar(halfVoxel);
-          const voxelMax = tempMatrix.position.clone().addScalar(halfVoxel);
-          const cameraMin = newPosition.clone().subScalar(radius);
-          const cameraMax = newPosition.clone().addScalar(radius);
-          
-          if (cameraMax.x > voxelMin.x && cameraMin.x < voxelMax.x &&
-              cameraMax.y > voxelMin.y && cameraMin.y < voxelMax.y &&
-              cameraMax.z > voxelMin.z && cameraMin.z < voxelMax.z) {
-            return true; // Collision detected
-          }
-        }
-      }
-      return false;
-    }
-
-    // Sliding collision: try to move along allowed axes
-  function moveWithSliding(currentPos: Vector3, movement: Vector3, radius: number = 0.25): Vector3 {
-      // Try full movement first
-      const desiredPos = currentPos.clone().add(movement);
-      if (!checkCollision(desiredPos, radius)) {
-        return desiredPos;
-      }
-
-      // Try sliding along each axis independently
-      const result = currentPos.clone();
-      
-      // Try X axis
-      const testX = currentPos.clone().add(new Vector3(movement.x, 0, 0));
-      if (!checkCollision(testX, radius)) {
-        result.x = testX.x;
-      }
-      
-      // Try Y axis
-      const testY = currentPos.clone().add(new Vector3(0, movement.y, 0));
-      if (!checkCollision(testY, radius)) {
-        result.y = testY.y;
-      }
-      
-      // Try Z axis
-      const testZ = currentPos.clone().add(new Vector3(0, 0, movement.z));
-      if (!checkCollision(testZ, radius)) {
-        result.z = testZ.z;
-      }
-      
-      // Try XY plane (diagonal sliding)
-      const testXY = currentPos.clone().add(new Vector3(movement.x, movement.y, 0));
-      if (!checkCollision(testXY, radius)) {
-        return testXY;
-      }
-      
-      // Try XZ plane
-      const testXZ = currentPos.clone().add(new Vector3(movement.x, 0, movement.z));
-      if (!checkCollision(testXZ, radius)) {
-        return testXZ;
-      }
-      
-      // Try YZ plane
-      const testYZ = currentPos.clone().add(new Vector3(0, movement.y, movement.z));
-      if (!checkCollision(testYZ, radius)) {
-        return testYZ;
-      }
-      
-      return result;
-    }
-
     // --- Controls & Loop ---
-    const { processInput, cleanup: cleanupControls } = setupControls(camera, mount, moveWithSliding);
+    const { processInput, cleanup: cleanupControls } = setupControls(camera, mount);
 
     let frameId: number;
     // FPS tracking
@@ -430,11 +325,7 @@ function App() {
 /* -----------------------------------------------------------
  * 辅助: 相机控制器
  * ----------------------------------------------------------- */
-function setupControls(
-  camera: PerspectiveCamera, 
-  mount: HTMLElement, 
-  moveWithSliding?: (currentPos: Vector3, movement: Vector3, radius?: number) => Vector3
-) {
+function setupControls(camera: PerspectiveCamera, mount: HTMLElement) {
   const keys: Record<string, boolean> = {};
   let yaw = 0;   // 左右旋转
   let pitch = 0; // 上下旋转
@@ -471,32 +362,18 @@ function setupControls(
 
       camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
-      // 移动控制 (WASD) with sliding collision
+      // 移动控制 (WASD)
       const dir = new Vector3();
       camera.getWorldDirection(dir);
       const forward = dir.clone();
       const right = new Vector3().crossVectors(dir, new Vector3(0, 1, 0)).normalize();
-      
-      const currentPos = camera.position.clone();
-      const totalMovement = new Vector3();
 
-      // Accumulate movement from all keys
-      if (keys['w']) totalMovement.addScaledVector(forward, speed);
-      if (keys['s']) totalMovement.addScaledVector(forward, -speed);
-      if (keys['a']) totalMovement.addScaledVector(right, -speed);
-      if (keys['d']) totalMovement.addScaledVector(right, speed);
-      if (keys['q']) totalMovement.y -= speed;
-      if (keys['e']) totalMovement.y += speed;
-
-      // Apply movement with sliding collision
-      if (totalMovement.lengthSq() > 0) {
-        if (moveWithSliding) {
-          const newPos = moveWithSliding(currentPos, totalMovement);
-          camera.position.copy(newPos);
-        } else {
-          camera.position.add(totalMovement);
-        }
-      }
+      if (keys['w']) camera.position.addScaledVector(forward, speed);
+      if (keys['s']) camera.position.addScaledVector(forward, -speed);
+      if (keys['a']) camera.position.addScaledVector(right, -speed);
+      if (keys['d']) camera.position.addScaledVector(right, speed);
+      if (keys['q']) camera.position.y -= speed;
+      if (keys['e']) camera.position.y += speed;
     },
     cleanup: () => {
       window.removeEventListener('keydown', onKeyDown);
