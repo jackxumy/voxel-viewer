@@ -21,9 +21,6 @@ def ensure_dir(directory):
         os.makedirs(directory)
 
 def load_raw_points(file_path):
-    """
-    读取原始数据，返回 float 类型的 (x, y, z) 列表
-    """
     points = []
     if not os.path.exists(file_path):
         print(f"Error: {file_path} not found.")
@@ -33,12 +30,11 @@ def load_raw_points(file_path):
     count = file_size // RECORD_SIZE
     print(f"Loading {count} records from {file_path}...")
 
+    # todo：流式或分块读取
     with open(file_path, 'rb') as f:
-        # 建议：如果文件非常大 (几GB)，这里可以改为分块读取
         buffer = f.read() 
         for i in range(count):
             offset = i * RECORD_SIZE
-            # 读取 x, y, z (double, 24 bytes) 和 filled (1 byte)
             data_slice = buffer[offset : offset + 25]
             x, y, z = struct.unpack('<ddd', data_slice[0:24])
             filled = struct.unpack('<B', data_slice[24:25])[0]
@@ -49,12 +45,9 @@ def load_raw_points(file_path):
     print(f"Loaded {len(points)} valid raw points.")
     return points
 
+# 解算出每一个体素的在模型中的索引号
 def init_lod0_grid(raw_points, voxel_size):
-    """
-    将原始浮点坐标转换为 LOD0 的整数网格坐标集合
-    这是算法的起点
-    """
-    print("Initializing LOD0 grid...")
+    print("Initializing LOD0 grid ID...")
     grid_voxels = set()
     for x, y, z in raw_points:
         gx = math.floor(x / voxel_size)
@@ -63,12 +56,8 @@ def init_lod0_grid(raw_points, voxel_size):
         grid_voxels.add((gx, gy, gz))
     return grid_voxels
 
+# 下采样（利用原有的索引计算下一层的索引，只要有一个小体素存在，整块都会保留，集合会自动合并重复的大体素）
 def downsample_grid(current_voxels):
-    """
-    核心算法：降采样
-    将当前的整数网格坐标 除以 2 (向下取整)，生成下一级网格
-    原理：LOD0 的 (0,0,0) 和 (1,0,0) 在 LOD1 中都会变为 (0,0,0)
-    """
     next_voxels = set()
     for gx, gy, gz in current_voxels:
         # 使用位运算 >> 1 等同于 // 2，但在大量数据下可能略快且语义明确
@@ -80,10 +69,6 @@ def downsample_grid(current_voxels):
     return next_voxels
 
 def save_chunks(grid_voxels, lod_level, voxel_size):
-    """
-    切分区块并保存
-    grid_voxels: 当前 LOD 下的整数网格坐标集合
-    """
     print(f"\n--- Processing LOD {lod_level} (Voxel Size: {voxel_size}) ---")
     print(f"Total Voxels: {len(grid_voxels)}")
 
@@ -92,16 +77,17 @@ def save_chunks(grid_voxels, lod_level, voxel_size):
     chunks = defaultdict(list)
     
     for gx, gy, gz in grid_voxels:
-        # 计算区块索引 (整数除以 32)
+        # 得到体素所在区块的索引
         cx = gx // CHUNK_DIMENSION
         cy = gy // CHUNK_DIMENSION
         cz = gz // CHUNK_DIMENSION
-        
-        # 计算世界坐标中心 (还原为浮点数用于渲染)
+
+        # 计算体素的浮点真实坐标
         wx = (gx + 0.5) * voxel_size
         wy = (gy + 0.5) * voxel_size
         wz = (gz + 0.5) * voxel_size
         
+        # 将体素加入到这个区块中
         chunks[(cx, cy, cz)].append((wx, wy, wz))
 
     print(f"Generated {len(chunks)} chunks (Dimension: {CHUNK_DIMENSION}x{CHUNK_DIMENSION}x{CHUNK_DIMENSION} voxels).")
@@ -153,17 +139,13 @@ def main():
         "levels": {}
     }
 
-    # 2. 初始化流程
     current_voxel_size = BASE_VOXEL_SIZE
-    # 步骤 1 (准备阶段): 将原始模型转为 LOD0 的整数网格
+    
     current_grid_voxels = init_lod0_grid(raw_points, current_voxel_size)
     
     lod_level = 0
-    
-    # 3. 循环：切分 -> 降采样 -> 切分
+
     while current_voxel_size <= MAX_VOXEL_SIZE:
-        
-        # --- 核心步骤 A: 使用当前模型切分区块并保存 ---
         level_data = save_chunks(current_grid_voxels, lod_level, current_voxel_size)
         
         global_manifest["levels"][lod_level] = {
