@@ -2,22 +2,18 @@ import { useEffect, useRef, useState } from "react";
 import {
   Scene,
   PerspectiveCamera,
+  BoxGeometry,
   MeshStandardMaterial,
   Vector3,
   AmbientLight,
   DirectionalLight,
   InstancedMesh,
+  Object3D,
   Group,
-  Color,
-  BufferGeometry,
-  BufferAttribute,
-  Mesh,
-  EdgesGeometry,
-  LineSegments,
-  LineBasicMaterial
+  Color
 } from "three";
-// 如果环境不支持 WebGPU,请改为 import { WebGLRenderer } from "three";
-import { WebGPURenderer } from "three/webgpu";
+// 如果环境不支持 WebGPU，请改为 import { WebGLRenderer } from "three";
+import { WebGPURenderer } from "three/webgpu"; 
 
 /* -------------------------------
  * 1. 类型定义 (严格匹配你的 JSON)
@@ -51,10 +47,10 @@ const CONFIG = {
   // Level 1: 60m ~ 150m (如果你的JSON里有 "1" 层级)
   // Level 2: 150m ~ 2000m (如果你的JSON里有 "2" 层级)
   visibilityRanges: {
-    0: [0, 2000],
-    1: [2000, 15000],
-    2: [15000, 60000],
-    3: [60000, 200000] // 新增 LOD4 (level 3)
+    0: [0, 60],
+    1: [60, 150],
+    2: [150, 600],
+    3: [600, 2000] // 新增 LOD4 (level 3)
   },
   colors: {
     0: 0xffffff, // Level 0 颜色 (白色)
@@ -69,13 +65,11 @@ function App() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [debugInfo, setDebugInfo] = useState("Initializing...");
   const [fps, setFps] = useState<number>(0);
-
+  
   // 状态引用
   const manifestRef = useRef<GlobalManifest | null>(null);
   const loadedChunksRef = useRef<Map<string, InstancedMesh>>(new Map());
   const loadingQueueRef = useRef<Set<string>>(new Set());
-  // toggles
-  const wireframeEnabledRef = useRef<boolean>(true);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -84,7 +78,7 @@ function App() {
     // --- Scene Setup ---
     const scene = new Scene();
     scene.background = new Color(0x202020);
-
+    
     const camera = new PerspectiveCamera(75, mount.clientWidth / mount.clientHeight, 0.1, 3000);
     camera.position.set(50, 50, 50); // 初始位置
 
@@ -98,6 +92,7 @@ function App() {
     scene.add(worldGroup);
 
     // --- Shared Geometry & Materials ---
+    const geometry = new BoxGeometry(1, 1, 1);
     const materials: { [key: number]: MeshStandardMaterial } = {
       0: new MeshStandardMaterial({ color: CONFIG.colors[0], roughness: 0.8 }),
       1: new MeshStandardMaterial({ color: CONFIG.colors[1], roughness: 0.9 }),
@@ -110,7 +105,7 @@ function App() {
      * ----------------------------------------------------------- */
     async function loadChunkMesh(level: string, chunkId: string, meta: ChunkMeta, voxelSize: number) {
       const uniqueKey = `${level}_${chunkId}`;
-
+      
       // 防止重复加载
       if (loadingQueueRef.current.has(uniqueKey)) return;
       loadingQueueRef.current.add(uniqueKey);
@@ -119,131 +114,56 @@ function App() {
         const url = `/chunks/${level}/${meta.file}`;
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
+        
         const buffer = await res.arrayBuffer();
         const positions = new Float32Array(buffer);
         const count = positions.length / 3;
 
-        // 构建体素集合用于邻接检测
-        const voxelSet = new Set<string>();
-        const voxelList: { x: number; y: number; z: number }[] = [];
+        // 创建 InstancedMesh
+        const mat = materials[level as unknown as keyof typeof materials] || materials[0];
+        const mesh = new InstancedMesh(geometry, mat, count);
         
+        // shadows disabled by global setting
+
+        const dummy = new Object3D();
+        const scale = voxelSize; 
+
+        // 填充矩阵
         for (let i = 0; i < count; i++) {
           const x = positions[i * 3 + 0];
           const y = positions[i * 3 + 1];
           const z = positions[i * 3 + 2];
-          const key = `${x},${y},${z}`;
-          voxelSet.add(key);
-          voxelList.push({ x, y, z });
+          
+          dummy.position.set(x, y, z);
+          dummy.scale.set(scale, scale, scale);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
         }
-
-        // 为每个体素生成可见面
-        const vertices: number[] = [];
-        const normals: number[] = [];
-        const indices: number[] = [];
         
-        const halfSize = voxelSize / 2;
+        mesh.instanceMatrix.needsUpdate = true;
         
-        // 六个面的定义：法线、顶点偏移
-        const faces = [
-          // Right (+X)
-          { normal: [1, 0, 0], vertices: [
-            [halfSize, -halfSize, -halfSize], [halfSize, halfSize, -halfSize],
-            [halfSize, halfSize, halfSize], [halfSize, -halfSize, halfSize]
-          ], check: [voxelSize, 0, 0] },
-          // Left (-X)
-          { normal: [-1, 0, 0], vertices: [
-            [-halfSize, -halfSize, halfSize], [-halfSize, halfSize, halfSize],
-            [-halfSize, halfSize, -halfSize], [-halfSize, -halfSize, -halfSize]
-          ], check: [-voxelSize, 0, 0] },
-          // Top (+Y)
-          { normal: [0, 1, 0], vertices: [
-            [-halfSize, halfSize, -halfSize], [-halfSize, halfSize, halfSize],
-            [halfSize, halfSize, halfSize], [halfSize, halfSize, -halfSize]
-          ], check: [0, voxelSize, 0] },
-          // Bottom (-Y)
-          { normal: [0, -1, 0], vertices: [
-            [-halfSize, -halfSize, halfSize], [-halfSize, -halfSize, -halfSize],
-            [halfSize, -halfSize, -halfSize], [halfSize, -halfSize, halfSize]
-          ], check: [0, -voxelSize, 0] },
-          // Front (+Z)
-          { normal: [0, 0, 1], vertices: [
-            [-halfSize, -halfSize, halfSize], [halfSize, -halfSize, halfSize],
-            [halfSize, halfSize, halfSize], [-halfSize, halfSize, halfSize]
-          ], check: [0, 0, voxelSize] },
-          // Back (-Z)
-          { normal: [0, 0, -1], vertices: [
-            [halfSize, -halfSize, -halfSize], [-halfSize, -halfSize, -halfSize],
-            [-halfSize, halfSize, -halfSize], [halfSize, halfSize, -halfSize]
-          ], check: [0, 0, -voxelSize] }
-        ];
-
-        for (const voxel of voxelList) {
-          for (const face of faces) {
-            // 检查邻居是否存在
-            const neighborKey = `${voxel.x + face.check[0]},${voxel.y + face.check[1]},${voxel.z + face.check[2]}`;
-            
-            if (!voxelSet.has(neighborKey)) {
-              // 该面未被遮挡，添加到几何体
-              // 重要：每个面使用独立的顶点索引，不共享顶点，这样边框才能正确显示
-              const startIndex = vertices.length / 3;
-              
-              for (const v of face.vertices) {
-                vertices.push(voxel.x + v[0], voxel.y + v[1], voxel.z + v[2]);
-                normals.push(face.normal[0], face.normal[1], face.normal[2]);
-              }
-              
-              // 两个三角形组成一个面
-              indices.push(
-                startIndex, startIndex + 1, startIndex + 2,
-                startIndex, startIndex + 2, startIndex + 3
-              );
-            }
-          }
-        }
-
-        if (vertices.length === 0) {
-          // 没有可见面（不太可能发生）
-          loadingQueueRef.current.delete(uniqueKey);
-          return;
-        }
-
-        // 创建合并的几何体
-        const mergedGeometry = new BufferGeometry();
-        mergedGeometry.setAttribute('position', new BufferAttribute(new Float32Array(vertices), 3));
-        mergedGeometry.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3));
-        mergedGeometry.setIndex(indices);
-
-        // 创建材质和网格
-        const mat = materials[level as unknown as keyof typeof materials] || materials[0];
-        const mesh = new Mesh(mergedGeometry, mat);
+        // 关键：禁止视锥体剔除，因为 InstancedMesh 默认包围盒计算可能不准，
+        // 或者手动计算 mesh.geometry.boundingSphere。为简单起见先设为 false。
         mesh.frustumCulled = false;
-
-        // 创建边框 - 使用角度阈值为0来显示所有边,包括共面的边
-        // 这样每个体素面都会有独立的边框
-        const edges = new EdgesGeometry(mergedGeometry, 0);
-        const wireMat = new LineBasicMaterial({ color: 0x000000 });
-        const wireframe = new LineSegments(edges, wireMat);
-        wireframe.visible = wireframeEnabledRef.current;
         
-        mesh.add(wireframe);
-        (mesh as any).userData.wire = wireframe;
+        mesh.visible = true; // 加载完成后默认显示
 
-        mesh.visible = true;
         worldGroup.add(mesh);
-        loadedChunksRef.current.set(uniqueKey, mesh as any);
+        loadedChunksRef.current.set(uniqueKey, mesh);
 
       } catch (err) {
         console.warn(`Failed to load ${uniqueKey}:`, err);
       } finally {
         loadingQueueRef.current.delete(uniqueKey);
       }
-    }    /* -----------------------------------------------------------
+    }
+
+    /* -----------------------------------------------------------
      * 核心逻辑: LOD 循环检测
      * ----------------------------------------------------------- */
     function updateLOD() {
       if (!manifestRef.current) return;
-
+      
       const levels = manifestRef.current.levels;
       const cameraPos = camera.position;
 
@@ -267,11 +187,11 @@ function App() {
         // 遍历该层级下的所有区块
         Object.entries(levelData.chunks).forEach(([chunkId, meta]) => {
           const uniqueKey = `${levelKey}_${chunkId}`;
-
+          
           // 计算距离：相机 <-> 区块中心
           const dist = Math.sqrt(
-            (cameraPos.x - (meta.x + halfSize)) ** 2 +
-            (cameraPos.y - (meta.y + halfSize)) ** 2 +
+            (cameraPos.x - (meta.x + halfSize)) ** 2 + 
+            (cameraPos.y - (meta.y + halfSize)) ** 2 + 
             (cameraPos.z - (meta.z + halfSize)) ** 2
           );
 
@@ -307,9 +227,9 @@ function App() {
         setDebugInfo("Fetching manifest...");
         const res = await fetch('/chunks/manifest.json');
         if (!res.ok) throw new Error("Manifest not found");
-
+        
         const manifest: GlobalManifest = await res.json();
-
+        
         // 简单校验
         if (!manifest.levels || !manifest.levels["0"]) {
           throw new Error("Manifest is valid but contains no levels.");
@@ -339,25 +259,115 @@ function App() {
     dirLight.castShadow = false;
     scene.add(dirLight);
 
-    // --- Wireframe toggle and Collision toggle ---
-    function applyWireframeVisibility(enabled: boolean) {
-      for (const mesh of loadedChunksRef.current.values()) {
-        const wire = (mesh as any).userData?.wire as LineSegments | undefined;
-        if (wire) wire.visible = enabled;
+    // --- Collision Detection ---
+  function checkCollision(newPosition: Vector3, radius: number = 0.25): boolean {
+      // Quick distance check - only test nearby meshes
+      const maxCheckDistance = 10; // Only check collisions within 10 units
+      
+      for (const [key, mesh] of loadedChunksRef.current.entries()) {
+        if (!mesh.visible) continue;
+        
+        // Get mesh level to determine voxel size
+        const level = parseInt(key.split('_')[0]);
+        const levelData = manifestRef.current?.levels[level];
+        if (!levelData) continue;
+        
+        const voxelSize = levelData.voxel_size;
+        const halfVoxel = voxelSize / 2;
+        
+        // Quick distance check to mesh center
+        const chunkKey = key.split('_').slice(1).join('_');
+        const chunkMeta = levelData.chunks[chunkKey];
+        if (!chunkMeta) continue;
+        
+        const chunkCenter = new Vector3(
+          chunkMeta.x + levelData.chunk_physical_size / 2,
+          chunkMeta.y + levelData.chunk_physical_size / 2,
+          chunkMeta.z + levelData.chunk_physical_size / 2
+        );
+        
+        const distanceToChunk = newPosition.distanceTo(chunkCenter);
+        if (distanceToChunk > maxCheckDistance + levelData.chunk_physical_size) continue;
+        
+        // Only check a subset of instances for performance (every 4th instance for higher LODs)
+        const step = level > 0 ? 4 : 1;
+        const tempMatrix = new Object3D();
+        
+        for (let i = 0; i < mesh.count; i += step) {
+          mesh.getMatrixAt(i, tempMatrix.matrix);
+          tempMatrix.matrix.decompose(tempMatrix.position, tempMatrix.quaternion, tempMatrix.scale);
+          
+          // Quick distance check
+          if (newPosition.distanceTo(tempMatrix.position) > radius + halfVoxel + 1) continue;
+          
+          // AABB collision check
+          const voxelMin = tempMatrix.position.clone().subScalar(halfVoxel);
+          const voxelMax = tempMatrix.position.clone().addScalar(halfVoxel);
+          const cameraMin = newPosition.clone().subScalar(radius);
+          const cameraMax = newPosition.clone().addScalar(radius);
+          
+          if (cameraMax.x > voxelMin.x && cameraMin.x < voxelMax.x &&
+              cameraMax.y > voxelMin.y && cameraMin.y < voxelMax.y &&
+              cameraMax.z > voxelMin.z && cameraMin.z < voxelMax.z) {
+            return true; // Collision detected
+          }
+        }
       }
+      return false;
     }
 
-    const onToggleKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if (e.key === 'Control') {
-        wireframeEnabledRef.current = !wireframeEnabledRef.current;
-        applyWireframeVisibility(wireframeEnabledRef.current);
+    // Sliding collision: try to move along allowed axes
+  function moveWithSliding(currentPos: Vector3, movement: Vector3, radius: number = 0.25): Vector3 {
+      // Try full movement first
+      const desiredPos = currentPos.clone().add(movement);
+      if (!checkCollision(desiredPos, radius)) {
+        return desiredPos;
       }
-    };
-    window.addEventListener('keydown', onToggleKeyDown);
+
+      // Try sliding along each axis independently
+      const result = currentPos.clone();
+      
+      // Try X axis
+      const testX = currentPos.clone().add(new Vector3(movement.x, 0, 0));
+      if (!checkCollision(testX, radius)) {
+        result.x = testX.x;
+      }
+      
+      // Try Y axis
+      const testY = currentPos.clone().add(new Vector3(0, movement.y, 0));
+      if (!checkCollision(testY, radius)) {
+        result.y = testY.y;
+      }
+      
+      // Try Z axis
+      const testZ = currentPos.clone().add(new Vector3(0, 0, movement.z));
+      if (!checkCollision(testZ, radius)) {
+        result.z = testZ.z;
+      }
+      
+      // Try XY plane (diagonal sliding)
+      const testXY = currentPos.clone().add(new Vector3(movement.x, movement.y, 0));
+      if (!checkCollision(testXY, radius)) {
+        return testXY;
+      }
+      
+      // Try XZ plane
+      const testXZ = currentPos.clone().add(new Vector3(movement.x, 0, movement.z));
+      if (!checkCollision(testXZ, radius)) {
+        return testXZ;
+      }
+      
+      // Try YZ plane
+      const testYZ = currentPos.clone().add(new Vector3(0, movement.y, movement.z));
+      if (!checkCollision(testYZ, radius)) {
+        return testYZ;
+      }
+      
+      return result;
+    }
 
     // --- Controls & Loop ---
-    const { processInput, cleanup: cleanupControls } = setupControls(camera, mount);
+    const { processInput, cleanup: cleanupControls } = setupControls(camera, mount, moveWithSliding);
 
     let frameId: number;
     // FPS tracking
@@ -390,23 +400,10 @@ function App() {
       cancelAnimationFrame(frameId);
       intervalPromise.then(id => id && clearInterval(id));
       cleanupControls();
-      window.removeEventListener('keydown', onToggleKeyDown);
       mount.removeChild(renderer.domElement);
       // cleanup resources
+      geometry.dispose();
       Object.values(materials).forEach(m => m.dispose());
-      // cleanup geometries
-      for (const mesh of loadedChunksRef.current.values()) {
-        if ((mesh as Mesh).geometry) {
-          (mesh as Mesh).geometry.dispose();
-        }
-        const wire = (mesh as any).userData?.wire;
-        if (wire && wire.geometry) {
-          wire.geometry.dispose();
-        }
-        if (wire && wire.material) {
-          wire.material.dispose();
-        }
-      }
     };
   }, []);
 
@@ -414,14 +411,14 @@ function App() {
     <>
       <div style={{
         position: 'absolute', top: 10, left: 10, padding: 12,
-        background: 'rgba(0,0,0,0.8)', color: '#0f0',
+        background: 'rgba(0,0,0,0.8)', color: '#0f0', 
         fontFamily: 'monospace', pointerEvents: 'none', borderRadius: 4
       }}>
         <div>System: {debugInfo}</div>
-        <div style={{ marginTop: 5, color: '#aaa', fontSize: '0.9em' }}>
+        <div style={{marginTop: 5, color: '#aaa', fontSize: '0.9em'}}>
           WASD to Move | Arrows to Look | Shift to Boost
         </div>
-        <div style={{ marginTop: 5, color: '#aaa', fontSize: '0.9em' }}>
+        <div style={{marginTop: 5, color: '#aaa', fontSize: '0.9em'}}>
           FPS: {fps}
         </div>
       </div>
@@ -434,8 +431,9 @@ function App() {
  * 辅助: 相机控制器
  * ----------------------------------------------------------- */
 function setupControls(
-  camera: PerspectiveCamera,
-  mount: HTMLElement
+  camera: PerspectiveCamera, 
+  mount: HTMLElement, 
+  moveWithSliding?: (currentPos: Vector3, movement: Vector3, radius?: number) => Vector3
 ) {
   const keys: Record<string, boolean> = {};
   let yaw = 0;   // 左右旋转
@@ -448,7 +446,7 @@ function setupControls(
     if (e.buttons === 1) {
       yaw -= e.movementX * 0.005;
       pitch -= e.movementY * 0.005;
-      pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch));
+      pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, pitch));
       camera.rotation.set(pitch, yaw, 0, 'YXZ');
     }
   };
@@ -467,25 +465,38 @@ function setupControls(
       if (keys['arrowright']) yaw -= rotSpeed;
       if (keys['arrowup']) pitch += rotSpeed;
       if (keys['arrowdown']) pitch -= rotSpeed;
-
+      
       // 限制上下视角
-      pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch));
+      pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, pitch));
 
       camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
-      // 移动控制 (WASD)
+      // 移动控制 (WASD) with sliding collision
       const dir = new Vector3();
       camera.getWorldDirection(dir);
       const forward = dir.clone();
       const right = new Vector3().crossVectors(dir, new Vector3(0, 1, 0)).normalize();
+      
+      const currentPos = camera.position.clone();
+      const totalMovement = new Vector3();
 
-      // Apply movement directly without collision
-      if (keys['w']) camera.position.addScaledVector(forward, speed);
-      if (keys['s']) camera.position.addScaledVector(forward, -speed);
-      if (keys['a']) camera.position.addScaledVector(right, -speed);
-      if (keys['d']) camera.position.addScaledVector(right, speed);
-      if (keys['q']) camera.position.y -= speed;
-      if (keys['e']) camera.position.y += speed;
+      // Accumulate movement from all keys
+      if (keys['w']) totalMovement.addScaledVector(forward, speed);
+      if (keys['s']) totalMovement.addScaledVector(forward, -speed);
+      if (keys['a']) totalMovement.addScaledVector(right, -speed);
+      if (keys['d']) totalMovement.addScaledVector(right, speed);
+      if (keys['q']) totalMovement.y -= speed;
+      if (keys['e']) totalMovement.y += speed;
+
+      // Apply movement with sliding collision
+      if (totalMovement.lengthSq() > 0) {
+        if (moveWithSliding) {
+          const newPos = moveWithSliding(currentPos, totalMovement);
+          camera.position.copy(newPos);
+        } else {
+          camera.position.add(totalMovement);
+        }
+      }
     },
     cleanup: () => {
       window.removeEventListener('keydown', onKeyDown);
