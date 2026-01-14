@@ -2,8 +2,15 @@
 struct Uniforms {
     projection: mat4x4<f32>,
     view: mat4x4<f32>,
+    cameraPos: vec3<f32>,
     time: f32,
-    padding: vec3<f32>,
+    lightPos: vec3<f32>,
+    shininess: f32,
+    lightColor: vec3<f32>,
+    ambient: f32,
+    diffuse: f32,
+    specular: f32,
+    padding: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -23,6 +30,7 @@ struct VertexOutput {
 
 fn gerstnerWave(pos: vec3<f32>, time: f32) -> vec3<f32> {
     var p = pos;
+    // 与 voxel.wgsl 保持一致的波浪参数与频率计算，确保边框与表面位移一致
     let waves = array<vec4<f32>, 3>(
         vec4<f32>(0.2, 8.0, 1.2, 1.0),
         vec4<f32>(0.1, 4.0, 2.0, 0.5),
@@ -34,15 +42,22 @@ fn gerstnerWave(pos: vec3<f32>, time: f32) -> vec3<f32> {
         let amp = w.x;
         let wl = w.y;
         let speed = w.z;
-        let d = normalize(vec2<f32>(w.w, sqrt(1.0 - w.w * w.w)));
-        
-        let freq = 2.0 / wl;
+        let d = normalize(vec2<f32>(w.w, sqrt(max(0.0, 1.0 - w.w * w.w))));
+
+        let freq = 2.0 * 3.14159 / wl;
         let phase = speed * freq;
         let theta = dot(d, pos.xz) * freq + time * phase;
-        
-        p.x += d.x * (amp * cos(theta));
-        p.z += d.y * (amp * cos(theta));
-        p.y += amp * sin(theta);
+
+        let cos_theta = cos(theta);
+        let sin_theta = sin(theta);
+
+        // 使用与 voxel 相同的位移公式（但这里只需返回位置）
+        // 陡峭度 q 控制局部 XZ 偏移对高度的影响，增加视觉细节
+        let q = 0.3 / (freq * amp * 4.0);
+
+        p.x += d.x * (q * amp * cos_theta);
+        p.z += d.y * (q * amp * cos_theta);
+        p.y += amp * sin_theta;
     }
     return p;
 }
