@@ -49,8 +49,8 @@ function App() {
         const view = new DataView(buf);
         console.log(buf.byteLength)
         // 根据新的 Python voxel_dtype 结构计算记录大小
-        // cx(float64=8) + cy(float64=8) + cz(float64=8) + filled(bool=1) + neighbors(6*int32=24) = 49 bytes
-        const recordSize = 49;
+        // cx(float64=8) + cy(float64=8) + cz(float64=8) + filled(bool=1) + neighbors(6*int32=24) = 33 bytes
+        const recordSize = 33;
 
         // 字段偏移（与新的 Python voxel_dtype 一致）
         const offCx = 0;         // float64
@@ -171,7 +171,7 @@ function App() {
 
 
     // NOTE: ensure the bin is placed at `voxel-app/public/voxels.bin` so it is served at `/voxels.bin`.
-    buildVoxelsFromBin('/voxel.bin');
+    buildVoxelsFromBin('/platform_32x32x1.bin');
 
     /* -------------------------------
      * (FBX loading is intentionally commented out)

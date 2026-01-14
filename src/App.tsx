@@ -19,9 +19,6 @@ import {
 // 如果环境不支持 WebGPU,请改为 import { WebGLRenderer } from "three";
 import { WebGPURenderer } from "three/webgpu";
 
-/* -------------------------------
- * 1. 类型定义 (严格匹配你的 JSON)
- * ------------------------------- */
 type ChunkMeta = {
   file: string;
   x: number;
@@ -42,19 +39,17 @@ type GlobalManifest = {
   levels: { [key: string]: LevelManifest };
 };
 
-/* -------------------------------
- * 2. 配置项
- * ------------------------------- */
+
 const CONFIG = {
   // 定义可见距离 [min, max]
   // Level 0: 0m ~ 60m
   // Level 1: 60m ~ 150m (如果你的JSON里有 "1" 层级)
   // Level 2: 150m ~ 2000m (如果你的JSON里有 "2" 层级)
   visibilityRanges: {
-    0: [0, 2000],
-    1: [2000, 15000],
-    2: [15000, 60000],
-    3: [60000, 200000] // 新增 LOD4 (level 3)
+    0: [0, 150],
+    1: [150, 300],
+    2: [300, 2000],
+    3: [2000, 60000] // 新增 LOD4 (level 3)
   },
   colors: {
     0: 0xffffff, // Level 0 颜色 (白色)
@@ -90,8 +85,8 @@ function App() {
 
     const renderer = new WebGPURenderer({ antialias: true });
     renderer.setSize(mount.clientWidth, mount.clientHeight);
-    // disable shadows for now to simplify rendering and improve performance
-    renderer.shadowMap.enabled = false;
+
+    renderer.shadowMap.enabled = true;
     mount.appendChild(renderer.domElement);
 
     const worldGroup = new Group();
