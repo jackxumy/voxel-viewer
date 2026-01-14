@@ -141,11 +141,12 @@ function App() {
         const canvas = canvasRef.current;
         if (!canvas) return;
 
-    let animationId: number;
-    let device: GPUDevice;
-    let context: GPUCanvasContext;
-    let cleanupControls: (() => void) | undefined;
-    let wireframeEnabled = true;
+        let animationId: number;
+        let device: GPUDevice | undefined;
+        let context: GPUCanvasContext | undefined;
+        let cleanupControls: (() => void) | undefined;
+        let wireframeEnabled = true;
+        let isDestroyed = false;
 
         async function init() {
             // 1. 获取 WebGPU 适配器与设备
@@ -160,7 +161,13 @@ function App() {
                 return;
             }
 
-            device = await adapter.requestDevice();
+            const requestedDevice = await adapter.requestDevice();
+            if (isDestroyed) {
+                requestedDevice.destroy();
+                return;
+            }
+            device = requestedDevice;
+
             const ctx = canvas!.getContext("webgpu");
             if (!ctx) {
                 setDebugInfo("Failed to get WebGPU context");
@@ -170,7 +177,7 @@ function App() {
 
             const format = navigator.gpu.getPreferredCanvasFormat();
             context.configure({
-                device,
+                device: device,
                 format,
                 alphaMode: "opaque"
             });
@@ -270,7 +277,7 @@ function App() {
             device.queue.writeBuffer(edgeIndexBuffer, 0, edgeIndices);
 
             // 4. 加载体素数据
-            const voxelData = await loadVoxelBin('/platform_32x32x1.bin');
+            const voxelData = await loadVoxelBin('/platform_32x128x1.bin');
             if (!voxelData || voxelData.length === 0) {
                 setDebugInfo("No voxels loaded");
                 return;
@@ -298,9 +305,9 @@ function App() {
             });
             device.queue.writeBuffer(instanceBuffer, 0, instanceData);
 
-            // 6. 创建 uniform 缓冲（相机矩阵）
+            // 6. 创建 uniform 缓冲（相机矩阵 + 时间）
             const uniformBuffer = device.createBuffer({
-                size: 64 * 2, // projection + view 各 64 bytes
+                size: 160, // 64 * 2 (matrices) + 32 (time + padding aligned to 16/32)
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
             });
 
@@ -391,7 +398,7 @@ function App() {
                             ]
                         },
                         {
-                            arrayStride: 32, // 8 floats per instance (same as main)
+                            arrayStride: 32, // 8 floats per instance
                             stepMode: "instance",
                             attributes: [
                                 { shaderLocation: 1, offset: 0, format: "float32x3" },   // instancePos
@@ -425,11 +432,27 @@ function App() {
 
             // 10. 相机控制
             const cameraState = {
-                position: new Float32Array([0, 5, 15]),
+                position: new Float32Array([2,2, 10]),
                 target: new Float32Array([0, 0, 0]),
                 yaw: 0,
                 pitch: 0
             };
+
+            // 如果 caller 提供了 target，基于 target-position 计算初始 yaw/pitch，
+            // 使相机初始朝向匹配 target（避免被默认的 yaw/pitch 覆盖为看向 -Z）
+            (function initYawPitchFromTarget() {
+                const dir = new Float32Array([
+                    cameraState.target[0] - cameraState.position[0],
+                    cameraState.target[1] - cameraState.position[1],
+                    cameraState.target[2] - cameraState.position[2]
+                ]);
+                normalize(dir);
+                // forward 实现为: [sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch)]
+                // 所以 pitch = asin(forward.y)
+                // yaw = atan2(forward.x, -forward.z)
+                cameraState.pitch = Math.asin(Math.max(-1, Math.min(1, dir[1])));
+                cameraState.yaw = Math.atan2(dir[0], -dir[2]);
+            })();
 
             // setupControls will manage keyboard and mouse input and provide processInput/cleanup
             const controls = setupControls(cameraState, canvas!);
@@ -457,10 +480,12 @@ function App() {
             let lastFpsCalc = performance.now();
 
             // 11. 渲染循环
-        function render() {
+            function render() {
+                if (isDestroyed || !device || !context) return;
+
                 // 处理输入
-            // processInput updates cameraState based on keyboard/mouse
-            processInput();
+                // processInput updates cameraState based on keyboard/mouse
+                processInput();
 
                 cameraState.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, cameraState.pitch));
 
@@ -475,6 +500,10 @@ function App() {
 
                 device.queue.writeBuffer(uniformBuffer, 0, projection.buffer, projection.byteOffset, projection.byteLength);
                 device.queue.writeBuffer(uniformBuffer, 64, view.buffer, view.byteOffset, view.byteLength);
+                
+                const time = performance.now() / 1000.0;
+                // 写入 time (128) 和 padding (144)，共需 32 字节以对齐结构体结尾 (160)
+                device.queue.writeBuffer(uniformBuffer, 128, new Float32Array([time, 0, 0, 0, 0, 0, 0, 0]));
 
                 // 渲染
                 const commandEncoder = device.createCommandEncoder();
@@ -534,17 +563,27 @@ function App() {
             render();
         }
 
-    init();
+        init();
 
         return () => {
+            isDestroyed = true;
             if (animationId) cancelAnimationFrame(animationId);
-            try { if (cleanupControls) cleanupControls(); } catch (e) { /* ignore */ }
-            if (device) device.destroy();
+            if (cleanupControls) {
+                try { cleanupControls(); } catch (e) { /* ignore */ }
+            }
+            if (device) {
+                device.destroy();
+                device = undefined;
+            }
         };
     }, []);
 
     // 加载体素二进制数据
-    async function loadVoxelBin(url: string): Promise<Array<{ x: number; y: number; z: number; scale: number; color: [number, number, number] }>> {
+    async function loadVoxelBin(url: string): Promise<Array<{ 
+        x: number; y: number; z: number; 
+        scale: number; 
+        color: [number, number, number];
+    }>> {
         try {
             const resp = await fetch(url);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -554,7 +593,11 @@ function App() {
             const recordSize = 33;
             const count = Math.floor(buf.byteLength / recordSize);
 
-            const voxels: Array<{ x: number; y: number; z: number; scale: number; color: [number, number, number] }> = [];
+            const voxels: Array<{ 
+                x: number; y: number; z: number; 
+                scale: number; 
+                color: [number, number, number];
+            }> = [];
 
             for (let i = 0; i < count; i++) {
                 const base = i * recordSize;
