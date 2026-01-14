@@ -60,9 +60,9 @@ fn vs_main(
     var worldPos = in.position * inflatedScale + instance.instancePos;
 
     // 只有顶端顶点应用位移
-    // if (isTop) {
-    //     worldPos = gerstnerWave(worldPos, uniforms.time);
-    // }
+    if (isTop) {
+        worldPos = gerstnerWave(worldPos, uniforms.time);
+    }
     
     out.position = uniforms.projection * uniforms.view * vec4<f32>(worldPos, 1.0);
     return out;

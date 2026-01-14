@@ -60,10 +60,10 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     var worldPos = localPos * in.instanceScale + in.instancePos;
 
     // 2. 只有表面顶点应用 Gerstner Wave
-    // if (isSurface) {
-    //     // 应用波浪产生的动态位移（包括 XZ 偏移和 Y 偏移）
-    //     worldPos = gerstnerWave(worldPos, uniforms.time);
-    // }
+    if (isSurface) {
+        // 应用波浪产生的动态位移（包括 XZ 偏移和 Y 偏移）
+        worldPos = gerstnerWave(worldPos, uniforms.time);
+    }
 
     out.position = uniforms.projection * uniforms.view * vec4<f32>(worldPos, 1.0);
     out.worldPos = worldPos;

@@ -232,22 +232,22 @@ function App() {
             const edgeVertices = new Float32Array([
                 // 8 个顶点（立方体的角）
                 -0.5, -0.5, -0.5,  // 0
-                 0.5, -0.5, -0.5,  // 1
-                 0.5,  0.5, -0.5,  // 2
-                -0.5,  0.5, -0.5,  // 3
-                -0.5, -0.5,  0.5,  // 4
-                 0.5, -0.5,  0.5,  // 5
-                 0.5,  0.5,  0.5,  // 6
-                -0.5,  0.5,  0.5,  // 7
+                0.5, -0.5, -0.5,  // 1
+                0.5, 0.5, -0.5,  // 2
+                -0.5, 0.5, -0.5,  // 3
+                -0.5, -0.5, 0.5,  // 4
+                0.5, -0.5, 0.5,  // 5
+                0.5, 0.5, 0.5,  // 6
+                -0.5, 0.5, 0.5,  // 7
             ]);
 
             const edgeIndices = new Uint16Array([
                 // 底面4条边
-                0, 1,  1, 2,  2, 3,  3, 0,
+                0, 1, 1, 2, 2, 3, 3, 0,
                 // 顶面4条边
-                4, 5,  5, 6,  6, 7,  7, 4,
+                4, 5, 5, 6, 6, 7, 7, 4,
                 // 垂直4条边
-                0, 4,  1, 5,  2, 6,  3, 7
+                0, 4, 1, 5, 2, 6, 3, 7
             ]);
 
             // 3. 创建顶点缓冲
@@ -432,27 +432,23 @@ function App() {
 
             // 10. 相机控制
             const cameraState = {
-                position: new Float32Array([2,2, 10]),
+                position: new Float32Array([2, 2, 10]),
                 target: new Float32Array([0, 0, 0]),
                 yaw: 0,
                 pitch: 0
             };
 
-            // 如果 caller 提供了 target，基于 target-position 计算初始 yaw/pitch，
-            // 使相机初始朝向匹配 target（避免被默认的 yaw/pitch 覆盖为看向 -Z）
-            (function initYawPitchFromTarget() {
-                const dir = new Float32Array([
-                    cameraState.target[0] - cameraState.position[0],
-                    cameraState.target[1] - cameraState.position[1],
-                    cameraState.target[2] - cameraState.position[2]
-                ]);
-                normalize(dir);
-                // forward 实现为: [sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch)]
-                // 所以 pitch = asin(forward.y)
-                // yaw = atan2(forward.x, -forward.z)
-                cameraState.pitch = Math.asin(Math.max(-1, Math.min(1, dir[1])));
-                cameraState.yaw = Math.atan2(dir[0], -dir[2]);
-            })();
+            const dir = new Float32Array([
+                cameraState.target[0] - cameraState.position[0],
+                cameraState.target[1] - cameraState.position[1],
+                cameraState.target[2] - cameraState.position[2]
+            ]);
+            normalize(dir);
+            // forward 实现为: [sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch)]
+            // 所以 pitch = asin(forward.y)
+            // yaw = atan2(forward.x, -forward.z)
+            cameraState.pitch = Math.asin(Math.max(-1, Math.min(1, dir[1])));
+            cameraState.yaw = Math.atan2(dir[0], -dir[2]);
 
             // setupControls will manage keyboard and mouse input and provide processInput/cleanup
             const controls = setupControls(cameraState, canvas!);
@@ -467,7 +463,7 @@ function App() {
                 }
             };
             window.addEventListener('keydown', onToggleWireframe);
-            
+
             // 更新 cleanup 以移除边框切换监听
             const originalCleanup = cleanupControls;
             cleanupControls = () => {
@@ -500,7 +496,7 @@ function App() {
 
                 device.queue.writeBuffer(uniformBuffer, 0, projection.buffer, projection.byteOffset, projection.byteLength);
                 device.queue.writeBuffer(uniformBuffer, 64, view.buffer, view.byteOffset, view.byteLength);
-                
+
                 const time = performance.now() / 1000.0;
                 // 写入 time (128) 和 padding (144)，共需 32 字节以对齐结构体结尾 (160)
                 device.queue.writeBuffer(uniformBuffer, 128, new Float32Array([time, 0, 0, 0, 0, 0, 0, 0]));
@@ -530,7 +526,7 @@ function App() {
                 renderPass.setVertexBuffer(1, instanceBuffer);
                 renderPass.setIndexBuffer(indexBuffer, "uint16");
                 renderPass.drawIndexed(indices.length, voxelData.length);
-                
+
                 // 绘制边框（如果启用）
                 if (wireframeEnabled) {
                     renderPass.setPipeline(wirePipeline);
@@ -540,7 +536,7 @@ function App() {
                     renderPass.setIndexBuffer(edgeIndexBuffer, "uint16");
                     renderPass.drawIndexed(edgeIndices.length, voxelData.length);
                 }
-                
+
                 renderPass.end();
 
                 device.queue.submit([commandEncoder.finish()]);
@@ -579,9 +575,9 @@ function App() {
     }, []);
 
     // 加载体素二进制数据
-    async function loadVoxelBin(url: string): Promise<Array<{ 
-        x: number; y: number; z: number; 
-        scale: number; 
+    async function loadVoxelBin(url: string): Promise<Array<{
+        x: number; y: number; z: number;
+        scale: number;
         color: [number, number, number];
     }>> {
         try {
@@ -593,9 +589,9 @@ function App() {
             const recordSize = 33;
             const count = Math.floor(buf.byteLength / recordSize);
 
-            const voxels: Array<{ 
-                x: number; y: number; z: number; 
-                scale: number; 
+            const voxels: Array<{
+                x: number; y: number; z: number;
+                scale: number;
                 color: [number, number, number];
             }> = [];
 
