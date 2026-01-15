@@ -177,7 +177,7 @@ function App() {
 
             const format = navigator.gpu.getPreferredCanvasFormat();
             context.configure({
-                device,
+                device: device,
                 format,
                 alphaMode: "opaque"
             });
@@ -232,22 +232,22 @@ function App() {
             const edgeVertices = new Float32Array([
                 // 8 个顶点（立方体的角）
                 -0.5, -0.5, -0.5,  // 0
-                 0.5, -0.5, -0.5,  // 1
-                 0.5,  0.5, -0.5,  // 2
-                -0.5,  0.5, -0.5,  // 3
-                -0.5, -0.5,  0.5,  // 4
-                 0.5, -0.5,  0.5,  // 5
-                 0.5,  0.5,  0.5,  // 6
-                -0.5,  0.5,  0.5,  // 7
+                0.5, -0.5, -0.5,  // 1
+                0.5, 0.5, -0.5,  // 2
+                -0.5, 0.5, -0.5,  // 3
+                -0.5, -0.5, 0.5,  // 4
+                0.5, -0.5, 0.5,  // 5
+                0.5, 0.5, 0.5,  // 6
+                -0.5, 0.5, 0.5,  // 7
             ]);
 
             const edgeIndices = new Uint16Array([
                 // 底面4条边
-                0, 1,  1, 2,  2, 3,  3, 0,
+                0, 1, 1, 2, 2, 3, 3, 0,
                 // 顶面4条边
-                4, 5,  5, 6,  6, 7,  7, 4,
+                4, 5, 5, 6, 6, 7, 7, 4,
                 // 垂直4条边
-                0, 4,  1, 5,  2, 6,  3, 7
+                0, 4, 1, 5, 2, 6, 3, 7
             ]);
 
             // 3. 创建顶点缓冲
@@ -277,7 +277,7 @@ function App() {
             device.queue.writeBuffer(edgeIndexBuffer, 0, edgeIndices);
 
             // 4. 加载体素数据
-            const voxelData = await loadVoxelBin('/voxel.bin');
+            const voxelData = await loadVoxelBin('/platform_32x128x1.bin');
             if (!voxelData || voxelData.length === 0) {
                 setDebugInfo("No voxels loaded");
                 return;
@@ -305,9 +305,9 @@ function App() {
             });
             device.queue.writeBuffer(instanceBuffer, 0, instanceData);
 
-            // 6. 创建 uniform 缓冲（相机矩阵）
+            // 6. 创建 uniform 缓冲（相机矩阵 + 光照参数 + 时间）
             const uniformBuffer = device.createBuffer({
-                size: 64 * 2, // projection + view 各 64 bytes
+                size: 208, // 48 * 4 bytes
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
             });
 
@@ -329,11 +329,11 @@ function App() {
             });
 
             // 7. 加载着色器
-            const shaderCode = await fetch('/src/shader/voxel.wgsl').then(r => r.text())
+            const shaderCode = await fetch('/src/shader/voxel_fft.wgsl').then(r => r.text())
             const shaderModule = device.createShaderModule({ code: shaderCode });
 
             // 7.1 加载线框着色器
-            const wireShaderCode = await fetch('/src/shader/vlines.wgsl').then(r => r.text());
+            const wireShaderCode = await fetch('/src/shader/vlines_fft.wgsl').then(r => r.text());
             const wireShaderModule = device.createShaderModule({ code: wireShaderCode });
 
             // 7.5 创建显式 PipelineLayout（使用之前定义的 bindGroupLayout）
@@ -398,7 +398,7 @@ function App() {
                             ]
                         },
                         {
-                            arrayStride: 32, // 8 floats per instance (same as main)
+                            arrayStride: 32, // 8 floats per instance
                             stepMode: "instance",
                             attributes: [
                                 { shaderLocation: 1, offset: 0, format: "float32x3" },   // instancePos
@@ -432,11 +432,23 @@ function App() {
 
             // 10. 相机控制
             const cameraState = {
-                position: new Float32Array([0, 5, 15]),
+                position: new Float32Array([2, 2, 10]),
                 target: new Float32Array([0, 0, 0]),
                 yaw: 0,
                 pitch: 0
             };
+
+            const dir = new Float32Array([
+                cameraState.target[0] - cameraState.position[0],
+                cameraState.target[1] - cameraState.position[1],
+                cameraState.target[2] - cameraState.position[2]
+            ]);
+            normalize(dir);
+            // forward 实现为: [sin(yaw)*cos(pitch), sin(pitch), -cos(yaw)*cos(pitch)]
+            // 所以 pitch = asin(forward.y)
+            // yaw = atan2(forward.x, -forward.z)
+            cameraState.pitch = Math.asin(Math.max(-1, Math.min(1, dir[1])));
+            cameraState.yaw = Math.atan2(dir[0], -dir[2]);
 
             // setupControls will manage keyboard and mouse input and provide processInput/cleanup
             const controls = setupControls(cameraState, canvas!);
@@ -451,7 +463,7 @@ function App() {
                 }
             };
             window.addEventListener('keydown', onToggleWireframe);
-            
+
             // 更新 cleanup 以移除边框切换监听
             const originalCleanup = cleanupControls;
             cleanupControls = () => {
@@ -466,6 +478,7 @@ function App() {
             // 11. 渲染循环
             function render() {
                 if (isDestroyed || !device || !context) return;
+
                 // 处理输入
                 // processInput updates cameraState based on keyboard/mouse
                 processInput();
@@ -483,6 +496,19 @@ function App() {
 
                 device.queue.writeBuffer(uniformBuffer, 0, projection.buffer, projection.byteOffset, projection.byteLength);
                 device.queue.writeBuffer(uniformBuffer, 64, view.buffer, view.byteOffset, view.byteLength);
+
+                const time = performance.now() / 1000.0;
+
+                // 填充剩余 Uniforms
+                const extraUniforms = new Float32Array([
+                    cameraState.position[0], cameraState.position[1], cameraState.position[2], 0.0,
+                    -20.0, 30.0, 20.0, 0.0, // lightPos
+                    1.0, 1.0, 0.9,  // lightColor
+                    time, 256.0, 0.2, 0.8,
+                    1.0, 0.0, 0.0, 0.0
+                ]); // offset 128 starts here
+
+                device.queue.writeBuffer(uniformBuffer, 128, extraUniforms);
 
                 // 渲染
                 const commandEncoder = device.createCommandEncoder();
@@ -509,7 +535,7 @@ function App() {
                 renderPass.setVertexBuffer(1, instanceBuffer);
                 renderPass.setIndexBuffer(indexBuffer, "uint16");
                 renderPass.drawIndexed(indices.length, voxelData.length);
-                
+
                 // 绘制边框（如果启用）
                 if (wireframeEnabled) {
                     renderPass.setPipeline(wirePipeline);
@@ -519,7 +545,7 @@ function App() {
                     renderPass.setIndexBuffer(edgeIndexBuffer, "uint16");
                     renderPass.drawIndexed(edgeIndices.length, voxelData.length);
                 }
-                
+
                 renderPass.end();
 
                 device.queue.submit([commandEncoder.finish()]);
@@ -542,7 +568,7 @@ function App() {
             render();
         }
 
-    init();
+        init();
 
         return () => {
             isDestroyed = true;
@@ -558,17 +584,25 @@ function App() {
     }, []);
 
     // 加载体素二进制数据
-    async function loadVoxelBin(url: string): Promise<Array<{ x: number; y: number; z: number; scale: number; color: [number, number, number] }>> {
+    async function loadVoxelBin(url: string): Promise<Array<{
+        x: number; y: number; z: number;
+        scale: number;
+        color: [number, number, number];
+    }>> {
         try {
             const resp = await fetch(url);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const buf = await resp.arrayBuffer();
             const view = new DataView(buf);
 
-            const recordSize = 49;
+            const recordSize = 33;
             const count = Math.floor(buf.byteLength / recordSize);
 
-            const voxels: Array<{ x: number; y: number; z: number; scale: number; color: [number, number, number] }> = [];
+            const voxels: Array<{
+                x: number; y: number; z: number;
+                scale: number;
+                color: [number, number, number];
+            }> = [];
 
             for (let i = 0; i < count; i++) {
                 const base = i * recordSize;
