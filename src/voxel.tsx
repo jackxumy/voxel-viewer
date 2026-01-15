@@ -307,7 +307,7 @@ function App() {
 
             // 6. 创建 uniform 缓冲（相机矩阵 + 光照参数 + 时间）
             const uniformBuffer = device.createBuffer({
-                size: 192, // 48 * 4 bytes
+                size: 208, // 48 * 4 bytes
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
             });
 
@@ -498,34 +498,15 @@ function App() {
                 device.queue.writeBuffer(uniformBuffer, 64, view.buffer, view.byteOffset, view.byteLength);
 
                 const time = performance.now() / 1000.0;
-                
+
                 // 填充剩余 Uniforms
-                const extraUniforms = new Float32Array(16); // offset 128 starts here
-                // 0..2: cameraPos
-                extraUniforms[0] = cameraState.position[0];
-                extraUniforms[1] = cameraState.position[1];
-                extraUniforms[2] = cameraState.position[2];
-                // 3: time
-                extraUniforms[3] = time;
-                // 4..6: lightPos
-                extraUniforms[4] = 20.0; 
-                extraUniforms[5] = 30.0;
-                extraUniforms[6] = 20.0;
-                // 7: shininess
-                extraUniforms[7] = 256.0; // 更高的光泽度，产生更尖锐的高光
-                // 8..10: lightColor
-                extraUniforms[8] = 1.0;
-                extraUniforms[9] = 1.0;
-                extraUniforms[10] = 0.9;
-                // 11: ambient
-                extraUniforms[11] = 0.2;
-                // 12: diffuse
-                extraUniforms[12] = 0.8;
-                // 13: specular
-                extraUniforms[13] = 1.0;
-                // 14..15: padding
-                extraUniforms[14] = 0;
-                extraUniforms[15] = 0;
+                const extraUniforms = new Float32Array([
+                    cameraState.position[0], cameraState.position[1], cameraState.position[2], 0.0,
+                    -20.0, 30.0, 20.0, 0.0, // lightPos
+                    1.0, 1.0, 0.9,  // lightColor
+                    time, 256.0, 0.2, 0.8,
+                    1.0, 0.0, 0.0, 0.0
+                ]); // offset 128 starts here
 
                 device.queue.writeBuffer(uniformBuffer, 128, extraUniforms);
 

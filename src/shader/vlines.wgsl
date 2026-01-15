@@ -3,14 +3,13 @@ struct Uniforms {
     projection: mat4x4<f32>,
     view: mat4x4<f32>,
     cameraPos: vec3<f32>,
-    time: f32,
     lightPos: vec3<f32>,
-    shininess: f32,
     lightColor: vec3<f32>,
+    time: f32,
+    shininess: f32,
     ambient: f32,
     diffuse: f32,
     specular: f32,
-    padding: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
